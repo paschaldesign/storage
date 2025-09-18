@@ -425,7 +425,7 @@ describe('Prefix Hierarchy Race Condition Tests', () => {
 
       // Delete all objects with high concurrency
       const batchSize = 3
-      const deletePromises: Promise<any>[] = []
+      const deletePromises: Promise<object[]>[] = []
 
       for (let i = 0; i < objects.length; i += batchSize) {
         const batch = objects.slice(i, i + batchSize)
@@ -563,6 +563,139 @@ describe('Prefix Hierarchy Race Condition Tests', () => {
         level: 2,
       })
     })
+
+    it('should handle deadlock scenario in concurrent cross-prefix moves without hanging', async () => {
+      // This test reproduces the deadlock scenario where two transactions
+      // try to move files between overlapping top-level prefixes in opposite directions:
+      // Transaction 1: photos/* -> docs/*  (locks photos -> docs)
+      // Transaction 2: docs/* -> photos/*  (locks docs -> photos)
+
+      const setupPromises = [
+        createObject('photos/batch1/image1.jpg'),
+        createObject('photos/batch1/image2.jpg'),
+        createObject('photos/batch2/image3.jpg'),
+        createObject('photos/batch2/image4.jpg'),
+        createObject('docs/folder1/document1.pdf'),
+        createObject('docs/folder1/document2.pdf'),
+        createObject('docs/folder2/document3.pdf'),
+        createObject('docs/folder2/document4.pdf'),
+      ]
+      await Promise.all(setupPromises)
+
+      // Verify initial state
+      let prefixes = await getPrefixes()
+      expect(prefixes).toContainEqual({ bucket_id: bucketName, name: 'photos', level: 1 })
+      expect(prefixes).toContainEqual({ bucket_id: bucketName, name: 'docs', level: 1 })
+
+      // Execute many concurrent moves in both directions to maximize deadlock probability
+      await Promise.all([
+        // Photos -> Docs moves (locks photos first, then docs)
+        moveObject('photos/batch1/image1.jpg', 'docs/moved/image1.jpg'),
+        moveObject('photos/batch1/image2.jpg', 'docs/moved/image2.jpg'),
+        moveObject('photos/batch2/image3.jpg', 'docs/moved/image3.jpg'),
+        moveObject('photos/batch2/image4.jpg', 'docs/moved/image4.jpg'),
+
+        // Docs -> Photos moves (locks docs first, then photos)
+        moveObject('docs/folder1/document1.pdf', 'photos/moved/document1.pdf'),
+        moveObject('docs/folder1/document2.pdf', 'photos/moved/document2.pdf'),
+        moveObject('docs/folder2/document3.pdf', 'photos/moved/document3.pdf'),
+        moveObject('docs/folder2/document4.pdf', 'photos/moved/document4.pdf'),
+      ])
+
+      // Verify final state: both prefixes should still exist since they have objects
+      prefixes = await getPrefixes()
+      expect(prefixes).toContainEqual({ bucket_id: bucketName, name: 'photos', level: 1 })
+      expect(prefixes).toContainEqual({ bucket_id: bucketName, name: 'docs', level: 1 })
+
+      // Verify all objects were moved correctly
+      const db = tHelper.database.connection.pool.acquire()
+      const objects = await db
+        .select('name')
+        .from('storage.objects')
+        .where('bucket_id', bucketName)
+        .orderBy('name')
+
+      const objectNames = objects.map((o) => o.name)
+
+      // Should have moved images
+      expect(objectNames).toContain('docs/moved/image1.jpg')
+      expect(objectNames).toContain('docs/moved/image2.jpg')
+      expect(objectNames).toContain('docs/moved/image3.jpg')
+      expect(objectNames).toContain('docs/moved/image4.jpg')
+
+      // Should have moved documents
+      expect(objectNames).toContain('photos/moved/document1.pdf')
+      expect(objectNames).toContain('photos/moved/document2.pdf')
+      expect(objectNames).toContain('photos/moved/document3.pdf')
+      expect(objectNames).toContain('photos/moved/document4.pdf')
+
+      // Original files should be gone
+      expect(objectNames).not.toContain('photos/batch1/image1.jpg')
+      expect(objectNames).not.toContain('docs/folder1/document1.pdf')
+
+      // Cleanup should have removed empty intermediate prefixes
+      const prefixNames = prefixes.map((p) => p.name)
+      expect(prefixNames).not.toContain('photos/batch1')
+      expect(prefixNames).not.toContain('photos/batch2')
+      expect(prefixNames).not.toContain('docs/folder1')
+      expect(prefixNames).not.toContain('docs/folder2')
+    })
+
+    it('should handle deadlock scenario with direct database updates (more reliable repro)', async () => {
+      // This test uses direct database operations to more reliably reproduce
+      // the deadlock scenario, bypassing API limitations
+
+      // Setup: Create test objects
+      await createObject('photos/file1.jpg')
+      await createObject('docs/file2.pdf')
+
+      // Get database connection
+      const db = tHelper.database.connection.pool.acquire()
+
+      // Execute concurrent UPDATE operations directly on the database
+      // This more closely matches the bash script scenario
+      const updatePromises = [
+        // Transaction 1: photos -> docs
+        db.raw(
+          `
+          UPDATE storage.objects
+          SET name = 'docs/moved-file1.jpg'
+          WHERE bucket_id = ? AND name = 'photos/file1.jpg'
+        `,
+          [bucketName]
+        ),
+
+        // Transaction 2: docs -> photos
+        db.raw(
+          `
+          UPDATE storage.objects
+          SET name = 'photos/moved-file2.pdf'
+          WHERE bucket_id = ? AND name = 'docs/file2.pdf'
+        `,
+          [bucketName]
+        ),
+      ]
+
+      const startTime = Date.now()
+      await Promise.all(updatePromises)
+      const endTime = Date.now()
+
+      // Should complete without deadlock
+      expect(endTime - startTime).toBeLessThan(5000)
+
+      // Verify updates succeeded
+      const objects = await db
+        .select('name')
+        .from('storage.objects')
+        .where('bucket_id', bucketName)
+        .orderBy('name')
+
+      const objectNames = objects.map((o) => o.name)
+      expect(objectNames).toContain('docs/moved-file1.jpg')
+      expect(objectNames).toContain('photos/moved-file2.pdf')
+      expect(objectNames).not.toContain('photos/file1.jpg')
+      expect(objectNames).not.toContain('docs/file2.pdf')
+    }, 10000)
   })
 
   describe('Stress Test: Move Operations', () => {
@@ -595,7 +728,7 @@ describe('Prefix Hierarchy Race Condition Tests', () => {
       )
 
       // Concurrently move all files into mvstress/dst while preserving sub-structure
-      const movePromises: Promise<any>[] = []
+      const movePromises: Promise<void>[] = []
       for (const s of sources) {
         for (const sub of subs) {
           for (let i = 0; i < countPerSub; i++) {
